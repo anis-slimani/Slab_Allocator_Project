@@ -1,0 +1,19 @@
+[package]
+name = "slab_allocator"
+version = "0.1.0"
+edition = "2021"
+description = "Slab allocator inspired by the Linux kernel SLUB allocator, written in Rust"
+
+[lib]
+path = "src/lib.rs"
+
+# `std` is enabled by default so that TestPageProvider is always available.
+# For bare-metal (no_std) usage, build with --no-default-features.
+[features]
+default = ["std"]
+std = []
+
+[[test]]
+name = "integration"
+path = "tests/integration.rs"
+# Integration tests always link std (Rust test harness requires it).
