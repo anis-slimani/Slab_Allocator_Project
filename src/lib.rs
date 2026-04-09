@@ -3,3 +3,4 @@
 pub mod freelist;
 pub mod page_provider;
 pub mod slab;
+pub mod cache;
