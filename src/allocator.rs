@@ -23,6 +23,41 @@ pub const SIZE_CLASSES: [usize; 9] = [8, 16, 32, 64, 128, 256, 512, 1024, 2048];
 
 const N_CLASSES: usize = SIZE_CLASSES.len();
 
+/// Allocation statistics returned by [`SlabAllocator::stats`].
+///
+/// Useful for monitoring memory usage, debugging leaks, and verifying
+/// that slab reclamation is working correctly.
+///
+/// # Examples
+///
+/// ```
+/// use slab_allocator::{SlabAllocator, page_provider::TestPageProvider};
+/// use core::alloc::Layout;
+///
+/// let mut alloc = SlabAllocator::new(TestPageProvider::new());
+/// let layout = Layout::from_size_align(32, 8).unwrap();
+///
+/// let ptr = alloc.alloc(layout);
+/// let s = alloc.stats();
+/// assert_eq!(s.alloc_count, 1);
+/// assert_eq!(s.active_objects, 1);
+///
+/// unsafe { alloc.dealloc(ptr, layout) };
+/// let s = alloc.stats();
+/// assert_eq!(s.dealloc_count, 1);
+/// assert_eq!(s.active_objects, 0);
+/// ```
+pub struct Stats {
+    /// Total number of successful allocations since the allocator was created.
+    pub alloc_count: usize,
+    /// Total number of deallocations since the allocator was created.
+    pub dealloc_count: usize,
+    /// Number of currently live allocations (`alloc_count - dealloc_count`).
+    pub active_objects: usize,
+    /// Number of slabs currently in use across all caches.
+    pub active_slabs: usize,
+}
+
 // SAFETY: SlabAllocator owns both the PageProvider pool and all NonNull pointers
 // in its caches. Concurrent access must be serialised externally.
 unsafe impl<P: PageProvider + Send> Send for SlabAllocator<P> {}
@@ -43,6 +78,8 @@ unsafe impl<P: PageProvider + Send> Send for SlabAllocator<P> {}
 pub struct SlabAllocator<P: PageProvider> {
     provider: P,
     caches: [Cache; N_CLASSES],
+    alloc_count: usize,
+    dealloc_count: usize,
 }
 
 impl<P: PageProvider> SlabAllocator<P> {
@@ -57,7 +94,7 @@ impl<P: PageProvider> SlabAllocator<P> {
     /// ```
     pub fn new(provider: P) -> Self {
         let caches = core::array::from_fn(|i| Cache::new(SIZE_CLASSES[i], SIZE_CLASSES[i]));
-        Self { provider, caches }
+        Self { provider, caches, alloc_count: 0, dealloc_count: 0 }
     }
 
     /// Find the cache index for a given `Layout`.
@@ -103,7 +140,10 @@ impl<P: PageProvider> SlabAllocator<P> {
         let provider = &mut self.provider;
         let cache = &mut self.caches[idx];
         match cache.alloc(provider) {
-            Some(ptr) => ptr.as_ptr(),
+            Some(ptr) => {
+                self.alloc_count += 1;
+                ptr.as_ptr()
+            }
             None => core::ptr::null_mut(),
         }
     }
@@ -147,6 +187,7 @@ impl<P: PageProvider> SlabAllocator<P> {
         let cache = &mut self.caches[idx];
         // SAFETY: ptr came from cache.alloc() (caller guarantee).
         unsafe { cache.dealloc(ptr, provider) };
+        self.dealloc_count += 1;
     }
 
     /// Total number of active slabs across all caches.
@@ -171,6 +212,36 @@ impl<P: PageProvider> SlabAllocator<P> {
         self.caches.iter().map(|c| c.slab_count()).sum()
     }
 
+    /// Return current allocation statistics.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use slab_allocator::{SlabAllocator, page_provider::TestPageProvider};
+    /// use core::alloc::Layout;
+    ///
+    /// let mut alloc = SlabAllocator::new(TestPageProvider::new());
+    /// let layout = Layout::from_size_align(32, 8).unwrap();
+    ///
+    /// let ptr = alloc.alloc(layout);
+    /// let s = alloc.stats();
+    /// assert_eq!(s.alloc_count, 1);
+    /// assert_eq!(s.active_objects, 1);
+    ///
+    /// unsafe { alloc.dealloc(ptr, layout) };
+    /// let s = alloc.stats();
+    /// assert_eq!(s.dealloc_count, 1);
+    /// assert_eq!(s.active_objects, 0);
+    /// ```
+    pub fn stats(&self) -> Stats {
+        Stats {
+            alloc_count: self.alloc_count,
+            dealloc_count: self.dealloc_count,
+            active_objects: self.alloc_count.saturating_sub(self.dealloc_count),
+            active_slabs: self.total_slab_count(),
+        }
+    }
+
     /// Mutable access to the underlying page provider.
     pub fn provider_mut(&mut self) -> &mut P {
         &mut self.provider
@@ -191,13 +262,11 @@ mod tests {
     fn alloc_dealloc_basic() {
         let mut a = make_alloc();
         let layout = Layout::from_size_align(32, 8).unwrap();
-
         let p1 = a.alloc(layout);
         assert!(!p1.is_null());
         let p2 = a.alloc(layout);
         assert!(!p2.is_null());
         assert_ne!(p1, p2);
-
         unsafe { a.dealloc(p1, layout) };
         unsafe { a.dealloc(p2, layout) };
         assert_eq!(a.total_slab_count(), 0);
@@ -218,14 +287,30 @@ mod tests {
     }
 
     #[test]
-    fn realloc_after_dealloc_reuses_ptr() {
+    fn realloc_after_dealloc_succeeds() {
+        // With slab coloring, a reclaimed+recreated slab may give a different
+        // address. We verify the allocation simply succeeds.
         let mut a = make_alloc();
         let layout = Layout::from_size_align(16, 8).unwrap();
         let p = a.alloc(layout);
         assert!(!p.is_null());
         unsafe { a.dealloc(p, layout) };
         let q = a.alloc(layout);
-        assert_eq!(p, q, "dealloc then alloc should reuse the slot");
+        assert!(!q.is_null(), "realloc after dealloc should succeed");
+    }
+
+    #[test]
+    fn realloc_within_live_slab_reuses_ptr() {
+        // Keep an anchor alive to prevent slab reclamation.
+        // The freed slot must be reused by the next alloc (freelist LIFO).
+        let mut a = make_alloc();
+        let layout = Layout::from_size_align(16, 8).unwrap();
+        let _anchor = a.alloc(layout);
+        let p = a.alloc(layout);
+        assert!(!p.is_null());
+        unsafe { a.dealloc(p, layout) };
+        let q = a.alloc(layout);
+        assert_eq!(p, q, "freed slot in live slab should be reused");
     }
 
     #[test]
@@ -248,5 +333,27 @@ mod tests {
         let mut a = make_alloc();
         let layout = Layout::from_size_align(8, 8).unwrap();
         unsafe { a.dealloc(core::ptr::null_mut(), layout) };
+    }
+
+    #[test]
+    fn stats_track_alloc_and_dealloc() {
+        let mut a = make_alloc();
+        let layout = Layout::from_size_align(32, 8).unwrap();
+
+        assert_eq!(a.stats().alloc_count, 0);
+        assert_eq!(a.stats().active_objects, 0);
+
+        let p1 = a.alloc(layout);
+        let p2 = a.alloc(layout);
+        assert_eq!(a.stats().alloc_count, 2);
+        assert_eq!(a.stats().active_objects, 2);
+
+        unsafe { a.dealloc(p1, layout) };
+        assert_eq!(a.stats().dealloc_count, 1);
+        assert_eq!(a.stats().active_objects, 1);
+
+        unsafe { a.dealloc(p2, layout) };
+        assert_eq!(a.stats().active_objects, 0);
+        assert_eq!(a.stats().active_slabs, 0);
     }
 }

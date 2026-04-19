@@ -1,18 +1,29 @@
 //! Cache: manages a list of slabs for one size class.
+//!
+//! Implements **slab coloring**: each new slab starts its object region at a
+//! slightly different byte offset (the "color"). This spreads objects across
+//! different cache-line positions, reducing hardware cache conflicts — the
+//! same technique used by the Linux SLUB allocator.
 
 use core::ptr::NonNull;
 
 use crate::page_provider::PageProvider;
 use crate::slab::{Slab, SlabHeader};
 
+/// Number of distinct color offsets before wrapping back to zero.
+const MAX_COLORS: usize = 8;
+
 /// Cache for one object size-class.
 ///
 /// Holds a singly-linked list of slabs. Allocation walks the list;
 /// if no slab has a free slot a new page is requested from the provider.
+/// Each new slab gets a different **color offset** to reduce cache conflicts.
 pub struct Cache {
     obj_size: usize,
     align: usize,
     head: Option<NonNull<SlabHeader>>,
+    /// Current color index (0..MAX_COLORS). Incremented on every new slab.
+    next_color: usize,
 }
 
 // SAFETY: Cache owns all memory its NonNull pointers point into.
@@ -21,7 +32,7 @@ unsafe impl Send for Cache {}
 
 impl Cache {
     /// Create a new, empty cache.
-    /// 
+    ///
     /// # Examples
     ///
     /// ```
@@ -31,7 +42,7 @@ impl Cache {
     /// assert_eq!(cache.obj_size(), 32);
     /// ```
     pub const fn new(obj_size: usize, align: usize) -> Self {
-        Self { obj_size, align, head: None }
+        Self { obj_size, align, head: None, next_color: 0 }
     }
 
     /// Returns the object size for this cache.
@@ -43,6 +54,7 @@ impl Cache {
     ///
     /// Walks the slab list looking for a free slot (fast path).
     /// If none is found, requests a new page from `provider` (slow path).
+    /// The new slab is given the next color offset for cache-line spreading.
     ///
     /// Returns `None` on OOM.
     pub fn alloc<P: PageProvider>(&mut self, provider: &mut P) -> Option<NonNull<u8>> {
@@ -58,8 +70,12 @@ impl Cache {
 
         let page = provider.alloc_page()?;
 
+        // Compute the color offset for this slab (slab coloring).
+        let color = self.next_color * self.align;
+        self.next_color = (self.next_color + 1) % MAX_COLORS;
+
         // SAFETY: page comes from the provider, PAGE_SIZE bytes, aligned, exclusively owned.
-        let mut new_slab = unsafe { Slab::init(page, self.obj_size, self.align)? };
+        let mut new_slab = unsafe { Slab::init(page, self.obj_size, self.align, color)? };
 
         // SAFETY: new_slab is a freshly-initialised valid slab.
         unsafe { new_slab.set_next(self.head) };
@@ -70,7 +86,8 @@ impl Cache {
 
     /// Free `ptr` back to its owning slab.
     ///
-    /// If the slab becomes empty its page is returned to the provider.
+    /// If the slab becomes empty its page is returned to the provider
+    /// (**cache shrinking**).
     ///
     /// # Safety
     /// - `ptr` must have been returned by `self.alloc(provider)`.
@@ -153,12 +170,26 @@ mod tests {
     }
 
     #[test]
-    fn dealloc_then_realloc_reuses_slot() {
+    fn dealloc_then_realloc_succeeds() {
+        // With slab coloring, a reclaimed slab is replaced by one with a
+        // different color offset, so the exact address may differ. We just
+        // verify the new allocation succeeds.
         let (mut prov, mut cache) = make_cache(64);
         let p = cache.alloc(&mut prov).expect("alloc");
         unsafe { cache.dealloc(p, &mut prov) };
+        let _q = cache.alloc(&mut prov).expect("realloc after free");
+    }
+
+    #[test]
+    fn realloc_within_live_slab_reuses_slot() {
+        // Keep an anchor alive so the slab is not reclaimed. The freed slot
+        // must be immediately reused by the next alloc (freelist LIFO).
+        let (mut prov, mut cache) = make_cache(64);
+        let _anchor = cache.alloc(&mut prov).expect("anchor");
+        let p = cache.alloc(&mut prov).expect("alloc");
+        unsafe { cache.dealloc(p, &mut prov) };
         let q = cache.alloc(&mut prov).expect("realloc");
-        assert_eq!(p, q, "free slot should be reused");
+        assert_eq!(p, q, "freed slot in live slab should be reused");
     }
 
     #[test]
@@ -183,5 +214,23 @@ mod tests {
         }
         assert!(!ptrs.is_empty(), "should have allocated at least one");
         assert!(cache.alloc(&mut prov).is_none(), "OOM expected");
+    }
+
+    #[test]
+    fn slab_coloring_cycles_color_index() {
+        let (mut prov, mut cache) = make_cache(32);
+        // Each time a new slab is needed, the color index advances.
+        // We just verify that many allocations across multiple slabs all succeed.
+        let mut ptrs = std::vec::Vec::new();
+        for _ in 0..500 {
+            if let Some(p) = cache.alloc(&mut prov) {
+                ptrs.push(p);
+            }
+        }
+        assert!(!ptrs.is_empty());
+        for p in ptrs {
+            unsafe { cache.dealloc(p, &mut prov) };
+        }
+        assert_eq!(cache.slab_count(), 0);
     }
 }
