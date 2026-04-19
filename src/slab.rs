@@ -2,9 +2,10 @@
 //!
 //! Layout:
 //! ```text
-//! [ SlabHeader | padding | obj0 | obj1 | ... | obj(capacity-1) ]
+//! [ SlabHeader | padding | color offset | obj0 | obj1 | ... | obj(cap-1) ]
 //! ```
 //! Free objects store a pointer to the next free object in their first bytes.
+//! The optional color offset shifts where objects start to reduce cache conflicts.
 
 use core::{mem, ptr::NonNull};
 
@@ -37,12 +38,23 @@ pub struct Slab {
 impl Slab {
     /// Initialise a slab inside `page`.
     ///
+    /// `color` is a byte offset added to the start of the data region to
+    /// implement **slab coloring**: consecutive slabs start their objects at
+    /// slightly different addresses, spreading accesses across cache lines and
+    /// reducing cache conflicts (the same technique used by the Linux SLUB
+    /// allocator).
+    ///
     /// Returns `None` if no objects fit (should not happen with normal sizes).
     ///
     /// # Safety
     /// - `page` must point to `PAGE_SIZE` bytes of writable, exclusively owned memory.
     /// - `page` must remain valid for the lifetime of this slab.
-    pub unsafe fn init(page: NonNull<u8>, obj_size: usize, align: usize) -> Option<Self> {
+    pub unsafe fn init(
+        page: NonNull<u8>,
+        obj_size: usize,
+        align: usize,
+        color: usize,
+    ) -> Option<Self> {
         if !align.is_power_of_two() || align > PAGE_SIZE {
             return None;
         }
@@ -51,7 +63,7 @@ impl Slab {
         let base = page.as_ptr() as usize;
         let hdr_ptr = page.as_ptr().cast::<SlabHeader>();
         let hdr_size = mem::size_of::<SlabHeader>();
-        let data_start = align_up(base + hdr_size, obj_size.max(align));
+        let data_start = align_up(base + hdr_size, obj_size.max(align)) + color;
 
         if data_start >= base + PAGE_SIZE {
             return None;
@@ -229,7 +241,7 @@ mod tests {
     fn alloc_slab(obj_size: usize, align: usize) -> (TestPageProvider, Slab) {
         let mut prov = TestPageProvider::new();
         let page = prov.alloc_page().expect("page");
-        let slab = unsafe { Slab::init(page, obj_size, align).expect("slab init") };
+        let slab = unsafe { Slab::init(page, obj_size, align, 0).expect("slab init") };
         (prov, slab)
     }
 
@@ -290,6 +302,16 @@ mod tests {
         unsafe { slab.free(p) };
         let q = slab.alloc().expect("second alloc");
         assert_eq!(p, q, "freed slot should be reused");
+    }
+
+    #[test]
+    fn coloring_does_not_break_allocation() {
+        let mut prov = TestPageProvider::new();
+        let page = prov.alloc_page().expect("page");
+        let color = 8;
+        let mut slab = unsafe { Slab::init(page, 32, 8, color).expect("colored slab") };
+        let p = slab.alloc().expect("alloc from colored slab");
+        assert!(slab.contains(p), "pointer must be within the page");
     }
 
     #[test]

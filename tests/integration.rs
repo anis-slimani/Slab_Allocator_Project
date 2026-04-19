@@ -36,15 +36,18 @@ fn two_allocs_return_distinct_pointers() {
 
 #[test]
 fn dealloc_then_alloc_reuses_pointer() {
+    // Keep an anchor alive so the slab is not reclaimed after the first free.
+    // Without reclamation, the freed slot is reused by the next alloc (LIFO).
     let mut a = make_alloc();
     let layout = Layout::from_size_align(16, 8).unwrap();
 
+    let _anchor = a.alloc(layout);
     let p = a.alloc(layout);
     assert!(!p.is_null());
     unsafe { a.dealloc(p, layout) };
 
     let q = a.alloc(layout);
-    assert_eq!(p, q, "freed slot should be immediately reused");
+    assert_eq!(p, q, "freed slot in live slab should be immediately reused");
 }
 
 // ─── Size / alignment boundaries ─────────────────────────────────────────────
@@ -254,4 +257,98 @@ fn all_size_classes_are_writable() {
         }
         unsafe { a.dealloc(p, layout) };
     }
+}
+
+// ── Bonus: Statistics tracking ────────────────────────────────────────────────
+
+#[test]
+fn stats_alloc_count_increases() {
+    let mut a = make_alloc();
+    let layout = Layout::from_size_align(32, 8).unwrap();
+
+    assert_eq!(a.stats().alloc_count, 0);
+    assert_eq!(a.stats().active_objects, 0);
+
+    let p1 = a.alloc(layout);
+    let p2 = a.alloc(layout);
+    assert_eq!(a.stats().alloc_count, 2);
+    assert_eq!(a.stats().active_objects, 2);
+
+    unsafe { a.dealloc(p1, layout) };
+    unsafe { a.dealloc(p2, layout) };
+    assert_eq!(a.stats().dealloc_count, 2);
+    assert_eq!(a.stats().active_objects, 0);
+}
+
+#[test]
+fn stats_active_slabs_matches_slab_count() {
+    let mut a = make_alloc();
+    let layout = Layout::from_size_align(64, 8).unwrap();
+
+    let p = a.alloc(layout);
+    assert_eq!(a.stats().active_slabs, a.total_slab_count());
+
+    unsafe { a.dealloc(p, layout) };
+    assert_eq!(a.stats().active_slabs, 0);
+}
+
+// ── Bonus: Slab coloring ──────────────────────────────────────────────────────
+
+#[test]
+fn slab_coloring_many_allocs_stay_valid() {
+    // Allocate enough objects to trigger many new slabs (and thus many color
+    // rotations). All pointers must be non-null, distinct, and writable.
+    let mut a = make_alloc();
+    let layout = Layout::from_size_align(32, 8).unwrap();
+    let mut ptrs = std::vec::Vec::new();
+
+    for _ in 0..400 {
+        let p = a.alloc(layout);
+        assert!(!p.is_null());
+        unsafe { core::ptr::write_bytes(p, 0xCC, 32) };
+        ptrs.push(p);
+    }
+
+    for i in 0..ptrs.len() {
+        for j in (i + 1)..ptrs.len() {
+            assert_ne!(ptrs[i], ptrs[j], "duplicate pointer from colored slabs");
+        }
+    }
+
+    for p in ptrs {
+        unsafe { a.dealloc(p, layout) };
+    }
+    assert_eq!(a.total_slab_count(), 0);
+}
+
+// ── Bonus: GlobalAlloc trait demo ─────────────────────────────────────────────
+//
+// In a real no_std kernel, registering LockedAllocator as #[global_allocator]
+// allows Box, Vec, String, etc. to work. The test below exercises the same
+// alloc/dealloc code path that Box::new() uses internally.
+
+#[test]
+fn global_alloc_trait_alloc_and_dealloc() {
+    use core::alloc::GlobalAlloc;
+    use slab_allocator::LockedAllocator;
+
+    let allocator: LockedAllocator<8> = LockedAllocator::new();
+    allocator.init();
+
+    let layout = Layout::from_size_align(64, 8).unwrap();
+
+    // This is exactly what Box::new() does under the hood.
+    let ptr = unsafe { allocator.alloc(layout) };
+    assert!(!ptr.is_null(), "GlobalAlloc::alloc should succeed");
+
+    unsafe { core::ptr::write_bytes(ptr, 0x42, 64) };
+    assert_eq!(unsafe { *ptr }, 0x42);
+
+    // And this is what Drop does when the Box is released.
+    unsafe { allocator.dealloc(ptr, layout) };
+
+    let s = allocator.stats().unwrap();
+    assert_eq!(s.alloc_count, 1);
+    assert_eq!(s.dealloc_count, 1);
+    assert_eq!(s.active_objects, 0);
 }

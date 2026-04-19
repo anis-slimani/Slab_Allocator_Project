@@ -27,7 +27,7 @@
 
 use core::alloc::{GlobalAlloc, Layout};
 
-use crate::allocator::SlabAllocator;
+use crate::allocator::{SlabAllocator, Stats};
 use crate::page_provider::StaticPageProvider;
 use crate::spinlock::Mutex;
 
@@ -106,6 +106,25 @@ impl<const N: usize> LockedAllocator<N> {
     /// [`init`]: LockedAllocator::init
     pub fn is_initialised(&self) -> bool {
         self.inner.lock().is_some()
+    }
+
+    /// Return allocation statistics, or `None` if not yet initialised.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use slab_allocator::global::LockedAllocator;
+    /// use core::alloc::{GlobalAlloc, Layout};
+    ///
+    /// let a: LockedAllocator<4> = LockedAllocator::new();
+    /// a.init();
+    /// let layout = Layout::from_size_align(32, 8).unwrap();
+    /// unsafe { a.alloc(layout) };
+    /// let s = a.stats().unwrap();
+    /// assert_eq!(s.alloc_count, 1);
+    /// ```
+    pub fn stats(&self) -> Option<Stats> {
+        self.inner.lock().as_ref().map(|a| a.stats())
     }
 }
 

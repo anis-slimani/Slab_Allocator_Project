@@ -84,6 +84,7 @@ pub mod spinlock;
 pub mod global;
 
 pub use allocator::SlabAllocator;
+pub use allocator::Stats;
 pub use page_provider::PageProvider;
 pub use allocator::SIZE_CLASSES;
 pub use slab::align_up;
@@ -120,4 +121,3 @@ pub const PAGE_SIZE: usize = page_provider::PAGE_SIZE;
 pub fn size_class_index(size: usize) -> Option<usize> {
     SIZE_CLASSES.iter().position(|&sc| sc >= size)
 }
-
